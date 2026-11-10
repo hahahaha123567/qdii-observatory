@@ -425,22 +425,33 @@ def run_update(root, cfg):
                    (stamp, started, None, 'running', 0, 0, 0, None))
     with connect(root) as db:
         cfg['_latest_prices'] = dict(db.execute('SELECT code,MAX(date) FROM prices GROUP BY code').fetchall())
+    catalog_error = None
     try:
         funds = discover(archive, cfg)
     except Exception as exc:
+        catalog_error = str(exc)
+        print(f'目录刷新失败: {exc}', file=sys.stderr, flush=True)
         with connect(root) as db:
-            db.execute('UPDATE runs SET status=?,finished_at=?,failed=?,error=? WHERE id=?',
-                       ('failed', now(), 1, str(exc), stamp))
-        print(f'目录更新失败: {exc}', file=sys.stderr, flush=True)
-        return dict(discovered=0, succeeded=0, failed=1)
-    with connect(root) as db:
-        db.execute('UPDATE funds SET active=0')
-        for fund in funds:
-            db.execute('''INSERT INTO funds(code,name,kind,market,benchmark,active)
-                          VALUES(:code,:name,:kind,:market,:benchmark,1)
-                          ON CONFLICT(code) DO UPDATE SET name=excluded.name,
-                          kind=excluded.kind,market=excluded.market,
-                          benchmark=excluded.benchmark,active=1''', fund)
+            funds = [dict(row) for row in db.execute(
+                'SELECT code,name,kind,market,benchmark FROM funds WHERE active=1 ORDER BY code')]
+            db.execute('UPDATE runs SET error=? WHERE id=?', (catalog_error, stamp))
+            if not funds:
+                db.execute('UPDATE runs SET status=?,finished_at=?,failed=? WHERE id=?',
+                           ('failed', now(), 1, stamp))
+        if not funds:
+            print('没有可用的已确认目录，停止行情及净值更新', file=sys.stderr, flush=True)
+            return dict(discovered=0, succeeded=0, failed=1, catalog_error=catalog_error)
+        print(f'沿用已确认目录更新 {len(funds)} 只基金，新产品发现等待下次刷新', file=sys.stderr, flush=True)
+    else:
+        with connect(root) as db:
+            db.execute('UPDATE funds SET active=0')
+            for fund in funds:
+                db.execute('''INSERT INTO funds(code,name,kind,market,benchmark,active)
+                              VALUES(:code,:name,:kind,:market,:benchmark,1)
+                              ON CONFLICT(code) DO UPDATE SET name=excluded.name,
+                              kind=excluded.kind,market=excluded.market,
+                              benchmark=excluded.benchmark,active=1''', fund)
+    discovered = 0 if catalog_error is not None else len(funds)
     succeeded = failed = 0
     with ThreadPoolExecutor(max_workers=cfg['workers'], thread_name_prefix='qdii-fetch') as pool:
         tasks = {pool.submit(fetch_fund, fund, archive, cfg): fund for fund in funds}
@@ -478,9 +489,12 @@ def run_update(root, cfg):
                 print(f'{code} 更新失败: {exc}', file=sys.stderr, flush=True)
     with connect(root) as db:
         db.execute('''UPDATE runs SET finished_at=?,status=?,discovered=?,succeeded=?,failed=?
-                      WHERE id=?''', (now(), 'partial' if failed else 'success',
-                                      len(funds), succeeded, failed, stamp))
-    return dict(discovered=len(funds), succeeded=succeeded, failed=failed)
+                      WHERE id=?''', (now(), 'partial' if failed else 'degraded' if catalog_error is not None else 'success',
+                                      discovered, succeeded, failed, stamp))
+    result = dict(discovered=discovered, succeeded=succeeded, failed=failed)
+    if catalog_error is not None:
+        result['catalog_error'] = catalog_error
+    return result
 
 
 def parse_market_size(source, code):

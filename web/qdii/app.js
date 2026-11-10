@@ -104,10 +104,10 @@ async function load(){
     initialized=true;renderOptions();renderCharts();renderScores();
     const run=data.last_run,navDates=data.funds.map(f=>f.latest_nav_date).filter(Boolean).sort();
     const status=$('status');
-    status.classList.toggle('error',!!run&&['partial','failed'].includes(run.status));
+    status.classList.toggle('error',!!run&&['partial','failed','degraded'].includes(run.status));
     status.textContent=!data.funds.length?'暂无数据，请先更新行情。':
       `行情截至 ${data.market_date||'—'} · 最新净值 ${navDates.at(-1)||'—'}${
-        run?.status==='running'?' · 正在更新':run?.status==='partial'||run?.status==='failed'?' · 最近更新失败，部分数据沿用历史记录':''}`;
+        run?.status==='running'?' · 正在更新':run?.status==='degraded'?' · 目录刷新失败，沿用已确认目录；已有标的行情与净值更新完成':run?.status==='partial'||run?.status==='failed'?' · 最近更新失败，部分数据沿用历史记录':''}`;
   }catch(error){$('status').classList.add('error');$('status').textContent=`数据读取失败：${error.message}`;}
   finally{$('refresh').disabled=false;}
 }

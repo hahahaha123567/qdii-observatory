@@ -214,12 +214,61 @@ class QdiiMarketTest(unittest.TestCase):
                 market, 'fetch_fund', return_value=(
                     [('2026-10-20', 1.2, 100)], [('2026-10-20', 1.0)])):
                 market.update(root)
-            with patch.object(market, 'discover', side_effect=ValueError('上游目录为空')):
+            with market.connect(root) as db:
+                db.execute('INSERT INTO funds(code,active) VALUES(?,0)', ('159941',))
+            with patch.object(market, 'discover', side_effect=ValueError('上游目录为空')), patch.object(
+                    market, 'fetch_fund', return_value=(
+                        [('2026-11-03', 1.3, 100)], [('2026-11-03', 1.1)])) as fetch, patch.object(
+                    market, 'update_sizes', return_value=False), patch.object(
+                    market, 'update_references', return_value=False), patch.object(
+                    market.sys, 'argv', ['qdii_market.py', '--root', str(root), 'update']):
+                self.assertEqual(market.main(), 0)
+            self.assertEqual(fetch.call_args.args[0], FUND)
+            self.assertEqual(fetch.call_count, 1)
+            data = market.read_data(root)
+            self.assertEqual(data['funds'][0]['active'], 1)
+            self.assertEqual(data['funds'][0]['history'][-1]['date'], '2026-11-03')
+            self.assertEqual(data['last_run']['status'], 'degraded')
+            self.assertEqual(data['last_run']['discovered'], 0)
+            self.assertEqual(data['last_run']['succeeded'], 1)
+            self.assertIn('上游目录为空', data['last_run']['error'])
+
+    def test_discovery_failure_without_active_catalog_stops_update(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with market.connect(root) as db:
+                db.execute('INSERT INTO funds(code,active) VALUES(?,0)', ('159941',))
+            with patch.object(market, 'discover', side_effect=ValueError('上游目录为空')), patch.object(
+                    market, 'fetch_fund') as fetch:
+                result = market.update(root)
+            self.assertEqual(result['failed'], 1)
+            fetch.assert_not_called()
+            data = market.read_data(root)
+            self.assertEqual(data['last_run']['status'], 'failed')
+
+    def test_cached_catalog_does_not_hide_quote_failure_and_discovery_can_recover(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with patch.object(market, 'discover', return_value=[FUND]), patch.object(
+                    market, 'fetch_fund', return_value=(
+                        [('2026-10-20', 1.2, 100)], [('2026-10-20', 1.0)])):
+                market.update(root)
+            with patch.object(market, 'discover', side_effect=ValueError('目录超时')), patch.object(
+                    market, 'fetch_fund', side_effect=ValueError('净值超时')):
                 result = market.update(root)
             self.assertEqual(result['failed'], 1)
             data = market.read_data(root)
-            self.assertEqual(data['funds'][0]['active'], 1)
-            self.assertEqual(data['last_run']['status'], 'failed')
+            self.assertEqual(data['last_run']['status'], 'partial')
+            self.assertIn('目录超时', data['last_run']['error'])
+            self.assertIn('净值超时', data['funds'][0]['error'])
+            self.assertEqual(data['funds'][0]['history'][0]['close'], 1.2)
+            with patch.object(market, 'discover', return_value=[FUND]), patch.object(
+                    market, 'fetch_fund', return_value=(
+                        [('2026-11-03', 1.3, 100)], [('2026-11-03', 1.1)])):
+                market.update(root)
+            data = market.read_data(root)
+            self.assertEqual(data['last_run']['status'], 'success')
+            self.assertIsNone(data['last_run']['error'])
 
     def test_profile_uses_full_name_to_exclude_unlisted_funds(self):
         row = ['160213', '', '国泰纳斯达克100指数', '指数型-海外股票']
