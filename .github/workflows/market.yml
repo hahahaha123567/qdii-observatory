@@ -1,0 +1,89 @@
+name: Update market and deploy Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # 北京时间 20:35 与次日 06:35，分别覆盖国内及美股收盘后
+    - cron: '35 12,22 * * *'
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: market-publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check behavior
+        run: |
+          python -m unittest discover -s tests
+          node --test tests/*.test.mjs
+      - name: Restore durable state
+        shell: bash
+        run: |
+          if gh release view market-state --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download market-state --repo "$GITHUB_REPOSITORY" --pattern state.tar.gz --dir /tmp/qdii-state
+            python scripts/site.py restore /tmp/qdii-state/state.tar.gz
+          else
+            # 区分首次部署与 API/权限错误，后者应停止
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > /tmp/releases.json
+            python -c 'import json; assert not any(r["tag_name"] == "market-state" for r in json.load(open("/tmp/releases.json")))'
+            python scripts/site.py restore seed/state.tar.gz
+          fi
+      - name: Collect market data
+        id: update
+        continue-on-error: true
+        run: python scripts/qdii_market.py update
+      - name: Persist state
+        run: |
+          python scripts/site.py pack /tmp/state.tar.gz
+          if ! gh release view market-state --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create market-state --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title 'Market state' --notes 'Rolling public market state for scheduled updates. Do not delete.' --prerelease
+          fi
+          gh release upload market-state /tmp/state.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Persist upstream archive
+        run: |
+          tag="market-raw-$(date -u +%Y-%m)"
+          tar -czf "/tmp/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz" -C raw/market/qdii .
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes 'Immutable upstream response batches.' --prerelease
+          fi
+          gh release upload "$tag" "/tmp/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz" --repo "$GITHUB_REPOSITORY"
+      - name: Archive upstream responses
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-${{ github.run_id }}-${{ github.run_attempt }}
+          path: raw/market/qdii/
+          retention-days: 90
+          if-no-files-found: ignore
+      - name: Preserve published site on collection failure
+        if: steps.update.outcome == 'failure'
+        run: |
+          echo '采集失败；状态已保留用于补采，线上继续使用上一版。'
+          exit 1
+      - name: Build static site
+        run: python scripts/site.py build dist
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

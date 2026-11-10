@@ -1,0 +1,7 @@
+{
+  "timeout_seconds": 25,
+  "attempts": 3,
+  "retry_delay_seconds": 1,
+  "workers": 4,
+  "min_request_interval_seconds": 1
+}

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QDII · 标普 / 纳指图表</title><link rel="icon" type="image/svg+xml" href="./favicon.svg"><link rel="stylesheet" href="./style.css"><script type="module" src="./app.js"></script></head>
+<body>
+<header><div><p class="eyebrow">QDII / MARKET OBSERVATORY</p><h1>标普 & 纳指</h1></div><div class="toolbar"><label>时间范围<select id="range"><option value="30">近 1 月</option><option value="90" selected>近 3 月</option><option value="180">近 6 月</option><option value="365">近 1 年</option><option value="1095">近 3 年</option><option value="1825">近 5 年</option><option value="3650">近 10 年</option><option value="0">全部历史</option></select></label><label>溢价口径<select id="basis"><option value="premium_same_date_pct">同日净值溢价</option><option value="premium_previous_nav_pct">此前净值参考溢价</option></select></label><button id="refresh">重新读取</button></div></header>
+<main>
+<p id="status" class="status" role="status" aria-live="polite">正在读取行情数据…</p>
+<details class="score-method"><summary>评分规则 · 收益优先</summary><p>同指数内按各指标百分位排名计分，高收益、大市值、低溢价得分更高，并列取平均。5年 / 3年 / 1年累计持有收益权重为35% / 25% / 20%，总市值10%，同日净值溢价10%。已调整份额拆分，现金分红默认按除息日收盘价再投资，允许碎份额。基金管理费、托管费等运作费用已体现在历史净值及价格中，不重复扣减；券商佣金和买卖价差未计入。</p><p>缺失指标不计分，其余权重按比例归一；可用指标不同的评分应谨慎比较。分红来源缺失、事件无法识别或缺少除息日价格时，收益留空。溢价采用最近有同日净值的统一日期，总市值采用最新统一行情快照，实际日期见下方。收益起点取周年日或之前最近交易日（最多7天）；不足完整年限留空。评分包含全部标的，不受图表选择影响。同日溢价为事后比较，历史评分不预测未来收益。</p><p>每组表格开头提供境外参考：VOO / QQQ 各含美元与人民币两行，收益采用 Yahoo Finance 分红拆分复权价；人民币收益按欧洲央行各历史日期的人民币、美元兑欧元参考汇率交叉换算（汇率缺日最多向前取7天）。参考收益截至不晚于国内行情日期的最近完整美股交易日，实际日期见各行；美元与人民币行使用相同交易日。参考行不参与 QDII 评分与图表选择，未采集市值及净值溢价显示 —。中美收盘时差、税费与换汇成本会影响实际结果。</p><p id="score-date"></p></details>
+<section class="index-section" aria-labelledby="sp-title">
+<div class="group-heading"><h2 id="sp-title">标普500 <span>S&P 500</span></h2></div>
+<div id="sp-scores" class="scores" role="region" aria-label="同指数标的评分" tabindex="0"></div>
+<div class="selection-controls"><label for="sp-threshold">默认展示最低评分 <input id="sp-threshold" type="number" min="0" max="100" step="1" required value="50"> 分</label><div><button data-group="标普500" data-on="true">全选</button><button data-group="标普500" data-on="false">取消全选</button></div></div>
+<div id="sp-funds" class="fund-options" role="group" aria-label="选择标普500标的"></div>
+<div class="chart-grid"><article class="chart-card"><div class="chart-heading"><h3>标普500 · 区间收益率</h3><span>起点 0% · 拆分调整 · 未计分红</span></div><div class="plot"><svg id="sp-return" role="img" aria-label="所选标普500基金的区间收益率"></svg><div class="tooltip" hidden></div></div></article><article class="chart-card"><div class="chart-heading"><h3>标普500 · 溢价率</h3><span class="premium-caption">同日净值 · 事后比较</span></div><div class="plot"><svg id="sp-premium" role="img" aria-label="所选标普500基金的历史溢价率"></svg><div class="tooltip" hidden></div></div></article></div>
+</section>
+<section class="index-section" aria-labelledby="ndx-title">
+<div class="group-heading"><h2 id="ndx-title">纳斯达克100 <span>NASDAQ 100</span></h2></div>
+<div id="ndx-scores" class="scores" role="region" aria-label="同指数标的评分" tabindex="0"></div>
+<div class="selection-controls"><label for="ndx-threshold">默认展示最低评分 <input id="ndx-threshold" type="number" min="0" max="100" step="1" required value="50"> 分</label><div><button data-group="纳斯达克100" data-on="true">全选</button><button data-group="纳斯达克100" data-on="false">取消全选</button></div></div>
+<div id="ndx-funds" class="fund-options" role="group" aria-label="选择纳斯达克100标的"></div>
+<div class="chart-grid"><article class="chart-card"><div class="chart-heading"><h3>纳指100 · 区间收益率</h3><span>起点 0% · 拆分调整 · 未计分红</span></div><div class="plot"><svg id="ndx-return" role="img" aria-label="所选纳斯达克100基金的区间收益率"></svg><div class="tooltip" hidden></div></div></article><article class="chart-card"><div class="chart-heading"><h3>纳指100 · 溢价率</h3><span class="premium-caption">同日净值 · 事后比较</span></div><div class="plot"><svg id="ndx-premium" role="img" aria-label="所选纳斯达克100基金的历史溢价率"></svg><div class="tooltip" hidden></div></div></article></div>
+</section>
+<footer>来源：东方财富 / 腾讯 / Yahoo Finance / 欧洲央行 · 同色对应同一标的，勾选同时作用于两张图。未披露净值留空；此前净值参考溢价为重建值。</footer>
+</main></body></html>
