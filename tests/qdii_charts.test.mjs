@@ -53,10 +53,10 @@ test('同组13只标的均可选择并绘制',()=>{
 
 test('默认按各指数评分门槛勾选，保留等于门槛的标的；手动选择优先',()=>{
   const scores=[
-    {fund:{code:'sp-low',benchmark:'标普500'},score:49.99},
-    {fund:{code:'sp-edge',benchmark:'标普500'},score:50},
-    {fund:{code:'ndx-low',benchmark:'纳斯达克100'},score:49.99},
-    {fund:{code:'ndx-edge',benchmark:'纳斯达克100'},score:50},
+    {fund:{code:'sp-low',benchmark:'标普500'},score:59.99},
+    {fund:{code:'sp-edge',benchmark:'标普500'},score:60},
+    {fund:{code:'ndx-low',benchmark:'纳斯达克100'},score:59.99},
+    {fund:{code:'ndx-edge',benchmark:'纳斯达克100'},score:60},
     {fund:{code:'missing',benchmark:'标普500'},score:null},
   ];
   const available=scores.map(r=>r.fund);

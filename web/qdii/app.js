@@ -3,7 +3,7 @@ import {initialSelection,selectFund,selectGroup,fundColor,buildChart,escapeHtml 
 const $=id=>document.getElementById(id);
 const groups=[{key:'sp',benchmark:'标普500'},{key:'ndx',benchmark:'纳斯达克100'}];
 const preferenceKey='qdii-chart-preferences-v1';
-const thresholds={'标普500':50,'纳斯达克100':50};
+const thresholds={'标普500':60,'纳斯达克100':60};
 let data=null,selected=new Set(),initialized=false;
 const plots=new Map();
 let saved=null;
@@ -11,12 +11,12 @@ try{saved=JSON.parse(localStorage.getItem(preferenceKey));}catch{}
 if(['7','30','90','180','365','1095','1825','3650','0'].includes(saved?.range))$('range').value=saved.range;
 if(['premium_same_date_pct','premium_previous_nav_pct'].includes(saved?.basis))$('basis').value=saved.basis;
 for(const group of groups){
-  const value=saved?.thresholdVersion===2?saved.thresholds?.[group.benchmark]:undefined;
+  const value=saved?.thresholdVersion===3?saved.thresholds?.[group.benchmark]:undefined;
   if(Number.isInteger(value)&&value>=0&&value<=100)thresholds[group.benchmark]=value;
   $(group.key+'-threshold').value=thresholds[group.benchmark];
 }
 function persist(){
-  try{localStorage.setItem(preferenceKey,JSON.stringify({thresholdVersion:2,thresholds,range:$('range').value,basis:$('basis').value}));}catch{}
+  try{localStorage.setItem(preferenceKey,JSON.stringify({thresholdVersion:3,thresholds,range:$('range').value,basis:$('basis').value}));}catch{}
 }
 function renderScores(){
   const rows=scoreFunds(data.funds,data.market_date);

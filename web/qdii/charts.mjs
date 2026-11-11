@@ -1,7 +1,7 @@
 export const palette=['#28645b','#bc6546','#4b77a5','#9a689e','#9b8735','#d089aa','#5e884a','#b64c5b','#557c83','#7861ac','#7b6b54','#386a9a','#977247'];
 export const escapeHtml = value => String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const format = (value,n=2) => value==null?'—':Number(value).toLocaleString('zh-CN',{minimumFractionDigits:n,maximumFractionDigits:n});
-export function initialSelection(funds,saved,scores=[],thresholds={'标普500':50,'纳斯达克100':50}){
+export function initialSelection(funds,saved,scores=[],thresholds={'标普500':60,'纳斯达克100':60}){
   const codes=new Set(funds.map(f=>f.code));
   if(Array.isArray(saved))return new Set(saved.filter(code=>codes.has(code)));
   return new Set(scores.filter(row=>codes.has(row.fund.code)&&Number.isFinite(row.score)&&
