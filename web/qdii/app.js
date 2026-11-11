@@ -8,7 +8,7 @@ let data=null,selected=new Set(),initialized=false;
 const plots=new Map();
 let saved=null;
 try{saved=JSON.parse(localStorage.getItem(preferenceKey));}catch{}
-if(['30','90','180','365','1095','1825','3650','0'].includes(saved?.range))$('range').value=saved.range;
+if(['7','30','90','180','365','1095','1825','3650','0'].includes(saved?.range))$('range').value=saved.range;
 if(['premium_same_date_pct','premium_previous_nav_pct'].includes(saved?.basis))$('basis').value=saved.basis;
 for(const group of groups){
   const value=saved?.thresholdVersion===2?saved.thresholds?.[group.benchmark]:undefined;
