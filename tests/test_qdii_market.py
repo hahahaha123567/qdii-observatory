@@ -153,6 +153,76 @@ class QdiiMarketTest(unittest.TestCase):
             market.parse_market_size('v="' + '~'.join(fields) + '";', '513500')
 
 
+    def test_defensive_cash_distributions_reinvest_on_exchange_ex_date(self):
+        archive_html = """<title>银华日利ETF(511880)基金分红送配</title>
+        <table><th>权益登记日</th><th>除息日</th><th>每10份分红</th><tbody>
+        <tr><td>2025年</td><td>2025-12-30</td><td>2025-12-30</td><td>每10份派现金10.0000元</td><td>2026-01-07</td></tr>
+        </tbody></table>"""
+        history = [{'date': '2025-12-30', 'close': 101, 'return_price_factor': 1},
+                   {'date': '2025-12-31', 'close': 100, 'return_price_factor': 1},
+                   {'date': '2026-01-05', 'close': 102, 'return_price_factor': 1}]
+        events = market.defensive_distributions(archive_html, '511880')
+        self.assertEqual(events[0]['date'], '2025-12-31')
+        market.apply_defensive_returns(history, events, [], '511880')
+        self.assertAlmostEqual(history[1]['return_index'], history[0]['return_index'])
+        self.assertAlmostEqual(history[2]['return_index'] / history[0]['return_index'] - 1, 0.02)
+        incomplete = history[::2]
+        with self.assertRaisesRegex(ValueError, '2025-12-31 缺少除息日收盘价'):
+            events = market.defensive_distributions(archive_html, '511880')
+            market.apply_defensive_returns(incomplete, events, [], '511880')
+        holiday = archive_html.replace('2025-12-30', '2026-09-30')
+        self.assertEqual(market.defensive_distributions(holiday, '511880')[0]['date'], '2026-10-08')
+
+    def test_defensive_money_returns_include_published_weekend_income(self):
+        incomes = [('2026-10-23', 3), ('2026-10-25', 2), ('2026-10-26', 1)]
+        cash = []
+        market.apply_defensive_returns(cash, [], incomes, '000198')
+        self.assertEqual([row['date'] for row in cash], [day for day, _ in incomes])
+        self.assertAlmostEqual(cash[-1]['return_index'] / cash[0]['return_index'], 1.0002 * 1.0001)
+        etf = [{'date': '2026-10-23', 'close': 100}, {'date': '2026-10-26', 'close': 101},
+               {'date': '2026-10-27', 'close': 102}]
+        market.apply_defensive_returns(etf, [], incomes, '511990')
+        self.assertAlmostEqual(etf[1]['return_index'] / etf[0]['return_index'], 1.01 * 1.0003 * 1.0002)
+        self.assertNotIn('return_index', etf[2])
+        etf = [{k: v for k, v in row.items() if k != 'return_index'} for row in etf]
+        market.apply_defensive_returns(etf, [], [*incomes[:2], ('2026-10-27', 1)], '511990')
+        self.assertNotIn('return_index', etf[1])
+        self.assertNotIn('return_index', etf[2])
+        market.apply_defensive_returns(etf, [], [*incomes, ('2026-10-27', 2)], '511990')
+        self.assertAlmostEqual(etf[2]['return_index'] / etf[0]['return_index'], 1.0003 * 1.0002 * 1.0001 * 1.02)
+
+    def test_shortened_money_snapshot_keeps_previously_disclosed_returns(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            fund = next(f for f in market.DEFENSIVE_FUNDS if f['code'] == '000198')
+            days = ['2026-10-30', '2026-11-01', '2026-11-02']
+
+            def response(url, archive, name, cfg):
+                data = [(int(market.datetime.fromisoformat(day).replace(tzinfo=market.SHANGHAI).timestamp()*1000), 1)
+                        for day in days]
+                source = 'var fS_code = "000198"; var Data_millionCopiesIncome = ' + json.dumps(data) + ';'
+                (archive / name).write_text(source)
+                return source
+
+            with patch.object(market, 'discover', return_value=[fund]), patch.object(
+                    market, 'download', side_effect=response):
+                self.assertEqual(market.update(root)['failed'], 0)
+                prior = market.read_data(root)['funds'][0]['history']
+                days[:] = ['2026-11-02', '2026-11-03']
+                self.assertEqual(market.update(root)['failed'], 1)
+            self.assertEqual(market.read_data(root)['funds'][0]['history'], prior)
+
+    def test_defensive_close_does_not_change_qdii_market_date(self):
+        fund = next(f for f in market.DEFENSIVE_FUNDS if f['code'] == '511580')
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with market.connect(root) as db:
+                for item, day in [(FUND, '2026-11-02'), (fund, '2026-11-03')]:
+                    db.execute('INSERT INTO funds(code, name, kind, market, benchmark) VALUES'
+                               '(:code,:name,:kind,:market,:benchmark)', item)
+                    db.execute('INSERT INTO prices(code,date,close) VALUES(?,?,?)', (item['code'], day, 100))
+            self.assertEqual(market.read_data(root)['market_date'], '2026-11-02')
+
     def test_premiums_do_not_fill_missing_same_day_nav_or_bridge_gaps(self):
         rows = market.join_history(
             [('2026-10-19', 1.1, 100), ('2026-10-20', 1.2, 100),

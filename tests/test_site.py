@@ -17,6 +17,58 @@ spec.loader.exec_module(site)
 
 
 class SiteTest(unittest.TestCase):
+    def test_cash_dividends_survive_stale_nav_and_incomplete_dividend_refresh(self):
+        fund = next(f for f in market.DEFENSIVE_FUNDS if f['code'] == '511880')
+        payout = ('<tr><td>2025</td><td>2025-12-30</td><td>2025-12-30</td>'
+                  '<td>每10份派现金10元</td><td>2026-01-07</td></tr>')
+        empty = '<tr><td>暂无分红信息!</td></tr>'
+        prices = [('2025-12-29', 101, 1), ('2025-12-30', 101, 1)]
+        navs = [('2025-12-29', 101), ('2025-12-30', 101)]
+        dividend_rows = empty
+        nav_marker = ''
+
+        def fetch(fund, archive, cfg):
+            (archive / '511880_dividends.html').write_text(
+                '<title>银华日利ETF(511880)基金分红送配</title>'
+                '<table><th>权益登记日</th><th>除息日</th><th>每10份分红</th><tbody>'
+                + dividend_rows + '</tbody></table>', encoding='utf-8')
+            (archive / '511880_nav.js').write_text('var Data_netWorthTrend = ' + json.dumps([
+                {'x': int(market.datetime.fromisoformat(day).replace(tzinfo=market.SHANGHAI).timestamp()*1000),
+                 'y': nav, 'unitMoney': nav_marker if day == '2025-12-30' else ''}
+                for day, nav in navs]) + ';', encoding='utf-8')
+            return prices, navs
+
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            root = Path(first)
+            with patch.object(market, 'discover', return_value=[fund]), patch.object(
+                    market, 'fetch_fund', side_effect=fetch):
+                self.assertEqual(market.run_update(root, {'workers': 1})['failed'], 0)
+                prices.append(('2025-12-31', 100, 1))
+                nav_marker = '分红：每10份派现金元'
+                self.assertEqual(market.run_update(root, {'workers': 1})['failed'], 1)
+                self.assertEqual(market.read_data(root)['funds'][0]['history'][-1]['date'], '2025-12-30')
+                navs.pop()
+                dividend_rows = payout
+                self.assertEqual(market.run_update(root, {'workers': 1})['failed'], 0)
+                accepted = market.read_data(root)['funds'][0]
+                self.assertEqual(accepted['history'][-1]['return_index'], 101)
+                self.assertEqual(accepted['distributions'][0]['date'], '2025-12-31')
+
+                prices.append(('2026-01-05', 102, 1))
+                navs.append(('2025-12-30', 101))
+                nav_marker = '拆分：每份基金份额折算份'
+                self.assertEqual(market.run_update(root, {'workers': 1})['failed'], 1)
+                nav_marker = ''
+                dividend_rows = empty
+                self.assertEqual(market.run_update(root, {'workers': 1})['failed'], 1)
+            with patch.object(site, 'ROOT', root):
+                site.pack(root / 'state.tar.gz')
+            with patch.object(site, 'ROOT', Path(second)):
+                site.restore(root / 'state.tar.gz')
+            restored = market.read_data(Path(second))['funds'][0]
+            self.assertEqual(restored['history'], accepted['history'])
+            self.assertEqual(restored['distributions'], accepted['distributions'])
+
     def test_catalog_fallback_survives_state_round_trip_and_publishes_updated_prices(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             root = Path(first)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""采集公开场内 QDII 日行情，并提供只读本地页面"""
+"""采集公开 QDII 与防守资产行情，并提供只读本地页面"""
 import argparse
 from contextlib import contextmanager
 import hashlib
 import bisect
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import fcntl
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +28,26 @@ ROOT = Path(__file__).resolve().parents[1]
 SHANGHAI = ZoneInfo('Asia/Shanghai')
 CATALOG_URL = 'https://fund.eastmoney.com/js/fundcode_search.js'
 PRICE_URL = 'https://push2his.eastmoney.com/api/qt/stock/kline/get'
+DEFENSIVE_GROUP = '防守资产'
+DEFENSIVE_FUNDS = (
+    dict(code='511880', name='银华日利ETF', kind='ETF', market=1, benchmark=DEFENSIVE_GROUP),
+    dict(code='511990', name='华宝添益ETF', kind='ETF', market=1, benchmark=DEFENSIVE_GROUP),
+    dict(code='511580', name='国债政金债ETF招商', kind='ETF', market=1, benchmark=DEFENSIVE_GROUP),
+    dict(code='511160', name='国债ETF东财', kind='ETF', market=1, benchmark=DEFENSIVE_GROUP),
+    dict(code='000198', name='天弘余额宝货币', kind='货币基金', market=None, benchmark=DEFENSIVE_GROUP),
+)
+MONEY_NAVS = {'511990': 100, '000198': 1}
+DEFENSIVE_CASH_CODES = {fund['code'] for fund in DEFENSIVE_FUNDS} - MONEY_NAVS.keys()
+# 交易日历覆盖前，银华日利的登记日和场内除息日按历史公告记录
+YINHUA_EX_DATES = {
+    '2014-01-16': '2014-01-17', '2014-12-30': '2014-12-31',
+    '2015-12-30': '2015-12-31', '2016-12-29': '2016-12-30',
+    '2017-12-28': '2017-12-29', '2018-12-27': '2018-12-28',
+    '2019-12-30': '2019-12-31', '2020-12-30': '2020-12-31',
+    '2021-12-30': '2021-12-31', '2022-12-29': '2022-12-30',
+    '2023-12-28': '2023-12-29', '2024-12-30': '2024-12-31',
+    '2025-12-30': '2025-12-31',
+}
 REQUEST_LOCK = threading.Lock()
 LAST_REQUEST = {}
 # (份额拆分日, 拆分后首个交易日, 拆分倍数)
@@ -78,6 +98,8 @@ def connect(root):
         CREATE TABLE IF NOT EXISTS navs (
             code TEXT, date TEXT, nav REAL, first_seen_at TEXT,
             last_seen_at TEXT, source_run TEXT, PRIMARY KEY(code,date));
+        CREATE TABLE IF NOT EXISTS cash_dividend_batches (
+            code TEXT PRIMARY KEY, source_run TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS runs (
             id TEXT PRIMARY KEY, started_at TEXT, finished_at TEXT,
             status TEXT, discovered INTEGER, succeeded INTEGER, failed INTEGER,
@@ -165,7 +187,7 @@ def discover(archive, cfg):
                 funds.append(fund)
     if not funds:
         raise ValueError('基金目录为空，拒绝覆盖历史目录')
-    return sorted(funds, key=lambda row: row['code'])
+    return sorted([*funds, *DEFENSIVE_FUNDS], key=lambda row: row['code'])
 
 
 def positive(value):
@@ -193,16 +215,19 @@ def parse_nav(source):
     return sorted(rows.items())
 
 
-def parse_distributions(source, code):
+def net_worth_events(source):
     match = re.search(r'var\s+Data_netWorthTrend\s*=\s*(\[.*?\])\s*;', source, re.S)
     if not match:
         raise ValueError('缺少分红事件来源')
-    events = []
     for item in json.loads(match[1]):
         text = item.get('unitMoney', '').strip()
-        if not text:
-            continue
-        day = datetime.fromtimestamp(item['x']/1000, SHANGHAI).date().isoformat()
+        if text:
+            yield datetime.fromtimestamp(item['x']/1000, SHANGHAI).date().isoformat(), text
+
+
+def parse_distributions(source, code):
+    events = []
+    for day, text in net_worth_events(source):
         if '拆分' in text and any(day == split[0] for split in SHARE_SPLITS.get(code, ())):
             continue
         cash = re.fullmatch(r'分红[：:]每份派现金([0-9.]+)元', text)
@@ -211,6 +236,100 @@ def parse_distributions(source, code):
         events.append(dict(date=day, amount=positive(cash[1]),
                            return_price_factor=historical_price_factor(code, day)))
     return events
+
+
+def parse_money_income(source, code):
+    match = re.search(r'var\s+Data_millionCopiesIncome\s*=\s*(\[.*?\])\s*;', source, re.S)
+    if not re.search(r'var\s+fS_code\s*=\s*"' + code + r'"\s*;', source) or not match:
+        raise ValueError(f'{code} 缺少对应的货币基金收益序列')
+    rows = {}
+    for timestamp, amount in json.loads(match[1]):
+        day = datetime.fromtimestamp(timestamp / 1000, SHANGHAI).date().isoformat()
+        amount = float(amount)
+        if not math.isfinite(amount) or amount <= -10000 or day in rows:
+            raise ValueError(f'{code} {day} 货币基金收益无效')
+        rows[day] = amount
+    if not rows:
+        raise ValueError(f'{code} 货币基金收益序列为空')
+    return sorted(rows.items())
+
+
+def defensive_distributions(source, code):
+    title = re.search(r'<title>[^<]*\(' + code + r'\)[^<]*基金分红送配', source)
+    table = re.search(r'权益登记日</th>\s*<th>除息日</th>\s*<th>每10份分红</th>.*?<tbody>(.*?)</tbody>',
+                      source, re.S)
+    if not title or not table:
+        raise ValueError(f'{code} 未找到对应的分红明细')
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table[1], re.S)
+    events = {}
+    for row in rows:
+        cells = re.findall(r'<td[^>]*>\s*([^<]*?)\s*</td>', row)
+        if len(rows) == 1 and cells == ['暂无分红信息!']:
+            return []
+        cash = re.fullmatch(r'每10份派现金([0-9]+(?:\.[0-9]+)?)元', cells[3]) if len(cells) == 5 else None
+        if not cash:
+            raise ValueError(f'{code} 无法确认分红明细')
+        registered, day = map(valid_date, cells[1:3])
+        if code == '511880' and day == registered:
+            # 上游同日记录为场外除息日，银华日利场内在登记日后的首个交易日除息
+            day = YINHUA_EX_DATES.get(registered)
+            if day is None:
+                next_day = date.fromisoformat(registered) + timedelta(days=1)
+                while not is_trading_day('CN', next_day):
+                    next_day += timedelta(days=1)
+                day = next_day.isoformat()
+        if day in events:
+            raise ValueError(f'{code} {day} 分红明细重复')
+        events[day] = dict(date=day, registered_date=registered, amount=positive(cash[1]) / 10,
+                           return_price_factor=historical_price_factor(code, day))
+    if not events and not rows:
+        raise ValueError(f'{code} 分红明细缺失')
+    return [events[day] for day in sorted(events)]
+
+
+def cash_dividend_batches(db):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cash_dividend_batches'").fetchone():
+        return {}
+    return dict(db.execute('SELECT code,source_run FROM cash_dividend_batches'))
+
+
+def apply_defensive_returns(history, events, incomes, code):
+    if code in MONEY_NAVS:
+        # 华宝每百份面值为 100×100 元，余额宝每万份面值为 10000×1 元
+        growth = 1
+        index = {}
+        for day, amount in incomes:
+            if code == '511990':
+                # 场内买入当日享有收益，卖出当日不享有
+                index[day] = growth
+            growth *= 1 + amount / 10000
+            if code == '000198':
+                index[day] = growth
+        if code == '000198':
+            history.extend(dict(date=day, return_index=value) for day, value in index.items())
+        else:
+            started = False
+            for row in history:
+                if row['date'] in index:
+                    row['return_index'] = row['close'] * index[row['date']]
+                    started = True
+                elif started:
+                    break
+        return
+    if not history:
+        return
+    prices = {row['date']: row['close'] * row['return_price_factor'] for row in history}
+    for event in events:
+        day = event['date']
+        if history[0]['date'] < day <= history[-1]['date'] and day not in prices:
+            raise ValueError(f'{code} {day} 缺少除息日收盘价')
+    by_date = {event['date']: event for event in events}
+    shares = 1
+    for row in history:
+        price = prices[row['date']]
+        if event := by_date.get(row['date']):
+            shares *= 1 + event['amount'] * event['return_price_factor'] / price
+        row['return_index'] = price * shares
 
 
 def parse_prices(payload):
@@ -277,7 +396,14 @@ def fetch_fund(fund, archive, cfg):
     code = fund['code']
     nav_source = download(f'https://fund.eastmoney.com/pingzhongdata/{code}.js',
                           archive, f'{code}_nav.js', cfg)
-    navs = parse_nav(nav_source)
+    if code in MONEY_NAVS:
+        navs = [(day, MONEY_NAVS[code]) for day, _ in parse_money_income(nav_source, code)]
+        if code == '000198':
+            return [], navs
+    else:
+        navs = parse_nav(nav_source)
+    if code in DEFENSIVE_CASH_CODES:
+        download(f'https://fundf10.eastmoney.com/fhsp_{code}.html', archive, f'{code}_dividends.html', cfg)
     clock = datetime.now(SHANGHAI)
     last_price = cfg.get('_latest_prices', {}).get(code)
     if not cfg.get('_full_history') and last_price == clock.date().isoformat() and clock.hour >= 16:
@@ -473,6 +599,42 @@ def run_update(root, cfg):
                           'tencent' if (archive / f'{code}_tencent_0.json').exists() else 'eastmoney')
                          for day, close, turnover in prices])
                     store_ohlc(db, candles, code, stamp)
+                    if code in DEFENSIVE_CASH_CODES:
+                        validate_history = [dict(row) for row in db.execute(
+                            'SELECT date,close FROM prices WHERE code=? ORDER BY date', (code,))]
+                        for row in validate_history:
+                            row['return_price_factor'] = historical_price_factor(code, row['date'])
+                        source = (archive / f'{code}_dividends.html').read_text(encoding='utf-8-sig')
+                        events = defensive_distributions(source, code)
+                        event_dates = {event[key] for event in events for key in ('date', 'registered_date')}
+                        nav_source = (archive / f'{code}_nav.js').read_text(encoding='utf-8-sig')
+                        for day, marker in net_worth_events(nav_source):
+                            if marker.startswith(('分红：', '分红:')) and day not in event_dates:
+                                raise ValueError(f'{code} {day} 净值已提示分红，分红明细尚未收录')
+                            if ('拆分' in marker or '折算' in marker) and validate_history and (
+                                    validate_history[0]['date'] < day <= validate_history[-1]['date']) and not any(
+                                    day == split[0] for split in SHARE_SPLITS.get(code, ())):
+                                raise ValueError(f'{code} {day} 份额折算缺少价格调整因子')
+                        previous = db.execute('SELECT source_run FROM cash_dividend_batches WHERE code=?',
+                                              (code,)).fetchone()
+                        if previous is None:
+                            previous = db.execute('SELECT source_run FROM navs WHERE code=? ORDER BY date DESC LIMIT 1',
+                                                  (code,)).fetchone()
+                        if previous:
+                            prior_path = archive.parent / previous[0] / f'{code}_dividends.html'
+                            known_dates = {event['date'] for event in
+                                           defensive_distributions(prior_path.read_text(encoding='utf-8-sig'), code)}
+                            missing_dates = known_dates.difference(event['date'] for event in events)
+                            if missing_dates:
+                                raise ValueError(f'{code} 分红原件遗漏已采集除息日 {min(missing_dates)}')
+                        apply_defensive_returns(validate_history, events, [], code)
+                        db.execute('''INSERT INTO cash_dividend_batches(code,source_run) VALUES(?,?)
+                                      ON CONFLICT(code) DO UPDATE SET source_run=excluded.source_run''', (code, stamp))
+                    if code in MONEY_NAVS:
+                        known_dates = {row[0] for row in db.execute('SELECT date FROM navs WHERE code=?', (code,))}
+                        missing_dates = known_dates.difference(day for day, _ in navs)
+                        if missing_dates:
+                            raise ValueError(f'{code} 收益原件遗漏 {len(missing_dates)} 个已采集日期，最早 {min(missing_dates)}')
                     db.executemany('''INSERT INTO navs VALUES(?,?,?,?,?,?)
                         ON CONFLICT(code,date) DO UPDATE SET nav=excluded.nav,
                         last_seen_at=excluded.last_seen_at,source_run=excluded.source_run''',
@@ -513,7 +675,8 @@ def update_sizes(root):
     archive = root / 'raw/market/qdii' / (datetime.now(SHANGHAI).strftime('%Y%m%dT%H%M%S%f') + '_sizes')
     archive.mkdir(parents=True)
     with connect(root) as db:
-        funds = [dict(r) for r in db.execute('SELECT code,market FROM funds WHERE active=1')]
+        funds = [dict(r) for r in db.execute(
+            'SELECT code,market FROM funds WHERE active=1 AND benchmark<>?', (DEFENSIVE_GROUP,))]
     result = dict(observed_at=now(), source='腾讯行情 · 总市值（元）', funds=[], errors={})
     for fund in funds:
         code = fund['code']
@@ -642,7 +805,8 @@ def read_data(root):
         funds=[dict(f, history=[], cny_history=[], error='尚未采集境外参考行情') for f in REFERENCE_FUNDS])
     path = root / 'data/processed/qdii/market.sqlite3'
     if not path.exists():
-        return dict(generated_at=now(), funds=[], last_run=None, market_date=None, references=references)
+        return dict(generated_at=now(), funds=[], last_run=None, market_date=None,
+                    defensive_market_date=None, references=references)
     db = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True)
     db.row_factory = sqlite3.Row
     try:
@@ -651,8 +815,11 @@ def read_data(root):
         sizes_path = root / 'data/processed/qdii/sizes.json'
         sizes = json.loads(sizes_path.read_text()) if sizes_path.exists() else {}
         sizes_by_code = {r['code']: r for r in sizes.get('funds', [])}
+        dividend_batches = cash_dividend_batches(db)
         funds = []
-        market_date = db.execute('SELECT MAX(p.date) FROM prices p JOIN funds f ON p.code=f.code WHERE f.active=1').fetchone()[0]
+        market_date = db.execute('''SELECT MAX(p.date) FROM prices p JOIN funds f ON p.code=f.code
+                                    WHERE f.active=1 AND f.benchmark IN (?,?)''', ('标普500', '纳斯达克100')).fetchone()[0]
+        latest_dates = {}
         for fund in db.execute('SELECT * FROM funds WHERE active=1 ORDER BY code'):
             item = dict(fund)
             item['market_size'] = sizes_by_code.get(fund['code'])
@@ -667,14 +834,28 @@ def read_data(root):
             nav_meta = {row['date']: row for row in item['nav_history']}
             item['distributions'] = []
             item['distribution_error'] = None
+            code = fund['code']
+            defensive = fund['benchmark'] == DEFENSIVE_GROUP
+            item['history'] = ([
+                dict(date=day, close=close, turnover=turnover, return_price_factor=historical_price_factor(code, day))
+                for day, close, turnover in prices
+            ] if defensive else join_history(prices, navs, code))
             try:
-                source_run = item['nav_history'][-1]['source_run']
-                source_path = root / 'raw/market/qdii' / source_run / (fund['code'] + '_nav.js')
-                item['distributions'] = parse_distributions(source_path.read_text(), fund['code'])
+                source_run = dividend_batches.get(code) or item['nav_history'][-1]['source_run']
+                source_dir = root / 'raw/market/qdii' / source_run
+                if code in DEFENSIVE_CASH_CODES:
+                    source = (source_dir / f'{code}_dividends.html').read_text(encoding='utf-8-sig')
+                    item['distributions'] = defensive_distributions(source, code)
+                    apply_defensive_returns(item['history'], item['distributions'], [], code)
+                else:
+                    source = (source_dir / f'{code}_nav.js').read_text(encoding='utf-8-sig')
+                    if code in MONEY_NAVS:
+                        apply_defensive_returns(item['history'], [], parse_money_income(source, code), code)
+                    else:
+                        item['distributions'] = parse_distributions(source, code)
             except (OSError, ValueError, IndexError, TypeError) as exc:
                 item['distribution_error'] = str(exc)
 
-            item['history'] = join_history(prices, navs, fund['code'])
             for row in item['history']:
                 row['nav_source_run'] = nav_meta.get(row['date'], {}).get('source_run')
                 row['nav_first_seen_at'] = nav_meta.get(row['date'], {}).get('first_seen_at')
@@ -682,12 +863,20 @@ def read_data(root):
                 'SELECT date,open,high,low,price_source,source_run,first_seen_at,last_seen_at FROM prices WHERE code=?',
                 (fund['code'],))}
             for row in item['history']:
-                row.update(provenance[row['date']])
+                row.update(provenance.get(row['date'], {}))
             item['latest_nav_date'] = navs[-1][0] if navs else None
             item['latest_nav'] = navs[-1][1] if navs else None
-            item['stale'] = bool(not prices or prices[-1][0] != market_date)
+            latest_dates[code] = next((row['date'] for row in reversed(item['history'])
+                                       if not defensive or 'return_index' in row), None)
             funds.append(item)
+        defensive_market_date = max((latest_dates[f['code']] for f in funds
+                                     if f['benchmark'] == DEFENSIVE_GROUP and latest_dates[f['code']]), default=None)
+        for fund in funds:
+            cutoff = defensive_market_date if fund['benchmark'] == DEFENSIVE_GROUP else market_date
+            latest = latest_dates[fund['code']]
+            fund['stale'] = not latest or bool(cutoff and latest < cutoff)
         return dict(generated_at=now(), market_date=market_date,
+                    defensive_market_date=defensive_market_date,
                     last_run=dict(last) if last else None, funds=funds, references=references)
     finally:
         db.close()

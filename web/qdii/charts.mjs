@@ -1,11 +1,20 @@
 export const palette=['#28645b','#bc6546','#4b77a5','#9a689e','#9b8735','#d089aa','#5e884a','#b64c5b','#557c83','#7861ac','#7b6b54','#386a9a','#977247'];
+export const defensiveGroup='防守资产';
 export const escapeHtml = value => String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const format = (value,n=2) => value==null?'—':Number(value).toLocaleString('zh-CN',{minimumFractionDigits:n,maximumFractionDigits:n});
-export function initialSelection(funds,saved,scores=[],thresholds={'标普500':60,'纳斯达克100':60}){
+export function initialSelection(funds,saved,scores=[],thresholds={'标普500':60,'纳斯达克100':60},previousFunds){
   const codes=new Set(funds.map(f=>f.code));
-  if(Array.isArray(saved))return new Set(saved.filter(code=>codes.has(code)));
-  return new Set(scores.filter(row=>codes.has(row.fund.code)&&Number.isFinite(row.score)&&
-    row.score>=thresholds[row.fund.benchmark]).map(row=>row.fund.code));
+  if(Array.isArray(saved)){
+    const selected=new Set(saved.filter(code=>codes.has(code)));
+    if(previousFunds){
+      const previousCodes=new Set(previousFunds.map(f=>f.code));
+      for(const fund of funds.filter(f=>f.benchmark===defensiveGroup&&!previousCodes.has(f.code)))selected.add(fund.code);
+    }
+    return selected;
+  }
+  const scored=scores.filter(row=>codes.has(row.fund.code)&&Number.isFinite(row.score)&&
+    row.score>=thresholds[row.fund.benchmark]).map(row=>row.fund.code);
+  return new Set([...scored,...funds.filter(f=>f.benchmark===defensiveGroup).map(f=>f.code)]);
 }
 export function selectFund(selected,code,on){
   const next=new Set(selected);on?next.add(code):next.delete(code);return next;
@@ -28,12 +37,13 @@ export function buildChart(funds,{benchmark,selected,type,days=90,end='',basis='
     fund:f,color:fundColor(funds,f),rows:f.history.filter(r=>(!start||r.date>=start)&&(!end||r.date<=end))
   }));
   if(type==='return')for(const s of series){
-    const first=s.rows.find(row=>finite(row.close)&&row.close>0);
+    const price=benchmark===defensiveGroup?row=>row.return_index:row=>row.close*(row.return_price_factor??1);
+    const validPrice=row=>finite(price(row))&&price(row)>0;
+    const first=s.rows.find(validPrice);
     if(!first){s.rows=[];continue;}
-    const base=first.close*(first.return_price_factor??1);
+    const base=price(first);
     s.startDate=first.date;
-    s.rows=s.rows.map(row=>({...row,return_pct:finite(row.close)&&row.close>0?
-      (row.close*(row.return_price_factor??1)/base-1)*100:null}));
+    s.rows=s.rows.map(row=>({...row,return_pct:validPrice(row)?(price(row)/base-1)*100:null}));
   }
   const chartValue=row=>type==='return'?row.return_pct:row[basis];
   const valid=row=>type==='candle'?candle(row):finite(chartValue(row));
@@ -47,7 +57,20 @@ export function buildChart(funds,{benchmark,selected,type,days=90,end='',basis='
   const pad=(max-min)*.09||.05;min-=pad;max+=pad;
   const dates=[...new Set(series.flatMap(s=>s.rows.map(r=>r.date)))].sort();
   const indices=new Map(dates.map((day,i)=>[day,i]));
-  const step=plotW/dates.length,x=day=>L+(indices.get(day)+.5)*step;
+  const step=plotW/dates.length;
+  let x=day=>L+(indices.get(day)+.5)*step;
+  let tickDates=dates;
+  if(benchmark===defensiveGroup&&type==='return'){
+    const group=funds.filter(f=>f.benchmark===benchmark);
+    const first=group.map(f=>f.history[0]?.date).filter(Boolean).sort()[0];
+    const last=group.map(f=>f.history.at(-1)?.date).filter(Boolean).sort().at(-1);
+    const left=Date.parse(start||first),right=Date.parse(end||last);
+    const span=right-left;
+    const tickCount=Math.min(width<450?3:4,span/86400000+1);
+    x=day=>span?L+16+(plotW-32)*(Date.parse(day)-left)/span:L+plotW/2;
+    tickDates=Array.from({length:tickCount},(_,i)=>
+      new Date(left+Math.round(span/86400000*i/(tickCount-1||1))*86400000).toISOString().slice(0,10));
+  }
   const y=value=>T+(max-value)/(max-min)*plotH;
   let svg='';
   for(let i=0;i<=4;i++){
@@ -55,9 +78,9 @@ export function buildChart(funds,{benchmark,selected,type,days=90,end='',basis='
     svg+=`<path d="M${L} ${yy}H${width-R}" stroke="#e8ece5"/><text x="${L-10}" y="${yy+4}" text-anchor="end" fill="#85908b" font-size="11">${format(value)}${type==='candle'?'':'%'}</text>`;
   }
   if(type!=='candle')svg+=`<path d="M${L} ${y(0)}H${width-R}" stroke="#b4beb1" stroke-dasharray="3 4"/>`;
-  const ticks=Math.min(width<450?3:4,dates.length);
+  const ticks=Math.min(width<450?3:4,tickDates.length);
   for(let i=0;i<ticks;i++){
-    const day=dates[Math.round(i*(dates.length-1)/(ticks-1||1))];
+    const day=tickDates[Math.round(i*(tickDates.length-1)/(ticks-1||1))];
     svg+=`<text x="${x(day)}" y="${height-8}" text-anchor="middle" fill="#85908b" font-size="10">${day}</text>`;
   }
   series.forEach((s,index)=>{

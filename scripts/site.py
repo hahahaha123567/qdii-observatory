@@ -9,7 +9,7 @@ import sqlite3
 import tarfile
 import tempfile
 
-from qdii_market import ROOT, read_data
+from qdii_market import DEFENSIVE_CASH_CODES, ROOT, cash_dividend_batches, read_data
 
 
 def build(output):
@@ -36,17 +36,21 @@ def pack(output):
         # backup 将 WAL 中的已提交记录一并保存
         with closing(sqlite3.connect(ROOT / folder / 'market.sqlite3')) as source, closing(sqlite3.connect(staging / folder / 'market.sqlite3')) as target:
             source.backup(target)
-            runs = source.execute('SELECT DISTINCT code,source_run FROM navs n WHERE date=(SELECT MAX(date) FROM navs WHERE code=n.code)').fetchall()
+            nav_runs = dict(target.execute('SELECT code,source_run FROM navs n WHERE date=(SELECT MAX(date) FROM navs WHERE code=n.code)'))
+            dividend_runs = {code: run for code, run in nav_runs.items() if code in DEFENSIVE_CASH_CODES}
+            dividend_runs.update(cash_dividend_batches(target))
         for filename in ('sizes.json', 'references.json'):
             source = ROOT / folder / filename
             if source.exists():
                 shutil.copy2(source, staging / folder / filename)
-        # read_data 需要最新净值原件解析分红；完整批次另外归档
-        for code, run in runs:
-            relative = Path('raw/market/qdii') / run / (code + '_nav.js')
-            target = staging / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(ROOT / relative, target)
+        # 收益依赖最近净值和分红原件，完整批次另外归档
+        for runs, suffix in ((nav_runs, 'nav.js'), (dividend_runs, 'dividends.html')):
+            for code, run in runs.items():
+                name = f'{code}_{suffix}'
+                relative = Path('raw/market/qdii') / run / name
+                target = staging / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, target)
         temporary = output.with_suffix('.tmp')
         with tarfile.open(temporary, 'w:gz') as archive:
             for source in sorted(staging.rglob('*')):

@@ -64,3 +64,30 @@ test('默认按各指数评分门槛勾选，保留等于门槛的标的；手�
   assert.deepEqual([...initialSelection(available,['sp-low','removed'],scores)],['sp-low']);
   assert.deepEqual([...initialSelection(available,[],scores)],[]);
 });
+
+test('防守资产默认全选，分红再投指数按所选区间首日归零',()=>{
+  const fund={code:'000198',benchmark:'防守资产',history:[
+    {date:'2026-10-01',return_index:1},
+    {date:'2026-10-20',return_index:1.02},
+    {date:'2026-10-21',return_index:1.0302}
+  ]};
+  const selected=initialSelection([...funds,fund],undefined);
+  assert.deepEqual([...selected],['000198']);
+  assert.deepEqual([...initialSelection([...funds,fund],[],undefined,undefined,funds)],['000198']);
+  assert.deepEqual([...initialSelection([...funds,fund],[],undefined,undefined,[...funds,fund])],[]);
+  const chart=buildChart([fund],{...options,benchmark:'防守资产',selected,type:'return',days:7});
+  assert.deepEqual(chart.points.map(p=>p.startDate),['2026-10-20','2026-10-20']);
+  assert.deepEqual(chart.points.map(p=>Number(p.value.toFixed(6))),[0,1]);
+});
+
+test('勾选有周末收益的货基不移动防守 ETF 的横坐标',()=>{
+  const cash={code:'000198',benchmark:'防守资产',history:['2026-11-06','2026-11-07','2026-11-08','2026-11-09']
+    .map(date=>({date,return_index:1}))};
+  const etf={code:'511990',benchmark:'防守资产',history:['2026-11-06','2026-11-09','2026-11-10']
+    .map(date=>({date,return_index:1}))};
+  const chart=selected=>buildChart([cash,etf],{benchmark:'防守资产',selected:new Set(selected),
+    type:'return',days:0,end:'2026-11-10'}).points.filter(p=>p.code===etf.code).map(p=>p.x);
+  const [friday,monday,tuesday]=chart(['511990']);
+  assert.deepEqual(chart(['000198','511990']),[friday,monday,tuesday]);
+  assert.ok(Math.abs((monday-friday)/(tuesday-monday)-3)<1e-9);
+});
