@@ -8,7 +8,7 @@ Python 3.12、Node.js 22，无需安装第三方依赖。网页为原生 HTML/CS
 
 1. 将本目录作为独立 Git 仓库推送到 GitHub，默认分支使用 `main`。`seed/state.tar.gz` 是公开历史启动数据，须一同提交。
 2. 在仓库 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。
-3. 在 **Actions → Update market and deploy Pages → Run workflow** 手动执行一次。以后推送 `main` 和定时任务都会更新并发布。
+3. 在 **Actions → Update market and deploy Pages → Run workflow** 手动执行一次。此后每天北京时间 07:35 检查交易日历并按需更新发布。推送 `main` 时只跑测试，网站更新随下次发布上线。
 4. 部署成功后，在工作流的 `github-pages` environment 中打开站点地址。支持 `https://用户名.github.io/仓库名/` 子路径。
 
 工作流使用仓库自带的 `GITHUB_TOKEN`，无需额外配置密钥。组织策略须允许 Actions 写入 Releases、使用 Pages，以及所引用的官方 actions。项目不包含远程仓库地址；可先在 GitHub 创建空仓库，然后执行：

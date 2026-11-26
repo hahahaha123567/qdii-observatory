@@ -4,24 +4,18 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    # 北京时间 20:35 与次日 06:35，分别覆盖国内及美股收盘后
-    - cron: '35 12,22 * * *'
+    # 北京时间 07:35，覆盖前一日 A 股及刚收盘的美股
+    - cron: '35 23 * * *'
 permissions:
   contents: write
   pages: write
   id-token: write
-concurrency:
-  group: market-publish
-  cancel-in-progress: false
 jobs:
-  publish:
+  check:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    env:
-      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,7 +28,36 @@ jobs:
         run: |
           python -m unittest discover -s tests
           node --test tests/*.test.mjs
+  publish:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: market-publish
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check trading calendars
+        id: calendar
+        run: |
+          market_date=$(python scripts/qdii_market.py daily-market-date)
+          echo "market_date=$market_date" >> "$GITHUB_OUTPUT"
+          if [[ -z "$market_date" ]]; then
+            echo '前一日中美市场均休市'
+          else
+            echo "目标交易日：$market_date"
+          fi
       - name: Restore durable state
+        id: restore
+        if: steps.calendar.outputs.market_date != '' || github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           if gh release view market-state --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -48,9 +71,13 @@ jobs:
           fi
       - name: Collect market data
         id: update
+        if: steps.calendar.outputs.market_date != ''
         continue-on-error: true
-        run: python scripts/qdii_market.py update
+        env:
+          MARKET_DATE: ${{ steps.calendar.outputs.market_date }}
+        run: python scripts/qdii_market.py update --market-date "$MARKET_DATE"
       - name: Persist state
+        if: steps.calendar.outputs.market_date != ''
         run: |
           python scripts/site.py pack /tmp/state.tar.gz
           if ! gh release view market-state --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -58,6 +85,7 @@ jobs:
           fi
           gh release upload market-state /tmp/state.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
       - name: Persist upstream archive
+        if: ${{ !cancelled() && (steps.update.outcome == 'success' || steps.update.outcome == 'failure') }}
         run: |
           tag="market-raw-$(date -u +%Y-%m)"
           tar -czf "/tmp/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz" -C raw/market/qdii .
@@ -65,27 +93,25 @@ jobs:
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes 'Immutable upstream response batches.' --prerelease
           fi
           gh release upload "$tag" "/tmp/upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz" --repo "$GITHUB_REPOSITORY"
-      - name: Archive upstream responses
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: upstream-${{ github.run_id }}-${{ github.run_attempt }}
-          path: raw/market/qdii/
-          retention-days: 90
-          if-no-files-found: ignore
       - name: Preserve published site on collection failure
         if: steps.update.outcome == 'failure'
         run: |
           echo '采集失败；状态已保留用于补采，线上继续使用上一版。'
           exit 1
       - name: Build static site
+        if: steps.restore.outcome == 'success'
         run: python scripts/site.py build dist
       - uses: actions/configure-pages@v5
+        if: steps.restore.outcome == 'success'
       - uses: actions/upload-pages-artifact@v3
+        id: pages_artifact
+        if: steps.restore.outcome == 'success'
         with:
           path: dist
       - name: Wait for Pages artifact visibility
+        if: steps.pages_artifact.outcome == 'success'
         run: sleep 60
       - name: Deploy Pages
         id: deployment
+        if: steps.pages_artifact.outcome == 'success'
         uses: actions/deploy-pages@v4

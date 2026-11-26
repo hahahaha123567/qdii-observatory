@@ -1,7 +1,9 @@
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,6 +71,58 @@ class QdiiMarketTest(unittest.TestCase):
             clock_type.now.side_effect = lambda zone: clock.astimezone(zone)
             self.assertFalse(market.is_trading_day('CN'))
             self.assertTrue(market.is_trading_day('US'))
+
+    def test_daily_market_date_reports_the_preceding_session_if_either_market_traded(self):
+        for morning, expected in [
+            ('2026-11-07', '2026-11-06'),
+            ('2026-11-09', ''),
+            ('2026-11-27', '2026-11-26'),
+            ('2026-10-02', '2026-10-01'),
+        ]:
+            clock = market.datetime.fromisoformat(f'{morning}T07:35:00+08:00')
+            output = io.StringIO()
+            with self.subTest(morning=morning), redirect_stdout(output), patch.object(
+                market.datetime, 'now', side_effect=lambda zone: clock.astimezone(zone),
+            ), patch.object(market.sys, 'argv', ['qdii_market.py', 'daily-market-date']):
+                self.assertEqual(market.main(), 0)
+                self.assertEqual(output.getvalue().strip(), expected)
+
+    def test_saturday_daily_update_collects_friday_prices_and_both_snapshots(self):
+        clock = market.datetime.fromisoformat('2026-11-07T07:35:00+08:00')
+        friday = '2026-11-06'
+        stamp = int(market.datetime.fromisoformat(f'{friday}T16:00:00-05:00').timestamp())
+        quote = ['0'] * 46
+        quote[2], quote[30], quote[45] = FUND['code'], '20261106150000', '1.2'
+
+        def response(url, archive, name, cfg, **kwargs):
+            if name.endswith('_nav.js'):
+                nav_timestamp = int(market.datetime.fromisoformat(f'{friday}T00:00:00+08:00').timestamp()) * 1000
+                return f'var Data_netWorthTrend = [{{"x":{nav_timestamp},"y":1}}];'
+            if name.endswith('_prices.json'):
+                return '{"rc":0,"data":{"klines":["2026-11-06,1.2,1.2,1.2,1.2,0,100"]}}'
+            if name.endswith('_quote.txt'):
+                return '"' + '~'.join(quote) + '"'
+            if name == 'ecb_fx.xml':
+                return ECB_FX
+            return json.dumps({'chart': {'result': [{
+                'meta': {'symbol': name.removesuffix('.json').upper(), 'currency': 'USD',
+                         'exchangeTimezoneName': 'America/New_York'},
+                'timestamp': [stamp],
+                'indicators': {'quote': [{'close': [100]}], 'adjclose': [{'adjclose': [100]}]}
+            }], 'error': None}})
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with patch.object(market.datetime, 'now', side_effect=lambda zone: clock.astimezone(zone)), patch.object(
+                market, 'discover', return_value=[FUND],
+            ), patch.object(market, 'download', side_effect=response), patch.object(
+                market.sys, 'argv', ['qdii_market.py', '--root', d, 'update', '--market-date', friday],
+            ):
+                self.assertEqual(market.main(), 0)
+            data = market.read_data(root)
+            self.assertEqual(data['market_date'], friday)
+            self.assertEqual(data['funds'][0]['market_size']['date'], friday)
+            self.assertEqual([fund['history'][-1]['date'] for fund in data['references']['funds']], [friday, friday])
 
     def test_ecb_fx_cross_rates_are_cny_per_usd_and_reject_invalid_source(self):
         source = ECB_FX.replace('</Cube></Envelope>', '<Cube time="2000-01-03"><Cube currency="USD" rate="1"/></Cube></Cube></Envelope>')

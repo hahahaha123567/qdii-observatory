@@ -332,19 +332,27 @@ def apply_defensive_returns(history, events, incomes, code):
         row['return_index'] = price * shares
 
 
-def parse_prices(payload):
+def closed_price_date(market_date):
+    if market_date is not None:
+        return market_date.isoformat()
+    # 当天盘中日线仍在变化，不作为日收盘价持久化
+    clock = datetime.now(SHANGHAI)
+    day = clock.date() - timedelta(days=1) if clock.hour < 16 else clock.date()
+    return day.isoformat()
+
+
+def parse_prices(payload, market_date=None):
     body = payload.get('data')
     if payload.get('rc') != 0 or not body or not body.get('klines'):
         raise ValueError('场内收盘行情为空或上游返回错误')
     rows = {}
-    clock = datetime.now(SHANGHAI)
+    cutoff = closed_price_date(market_date)
     for item in body['klines']:
         fields = item.split(',')
         day, close, turnover = valid_date(fields[0]), positive(fields[2]), float(fields[6])
         if not math.isfinite(turnover) or turnover < 0:
             raise ValueError(f'{day} 成交额无效')
-        # 当天盘中日线仍在变化，不作为日收盘价持久化
-        if day > clock.date().isoformat() or (day == clock.date().isoformat() and clock.hour < 16):
+        if day > cutoff:
             continue
         rows[day] = (day, close, turnover)
     if not rows:
@@ -355,6 +363,7 @@ def parse_prices(payload):
 def tencent_prices(fund, archive, cfg):
     code = fund['code']
     symbol = ('sh' if fund['market'] == 1 else 'sz') + code
+    cutoff = closed_price_date(cfg.get('_market_date'))
     end = datetime.now(SHANGHAI).date().isoformat()
     rows = {}
     page = 0
@@ -373,8 +382,7 @@ def tencent_prices(fund, archive, cfg):
             break
         for row in batch:
             day = valid_date(row[0])
-            clock = datetime.now(SHANGHAI)
-            if day > clock.date().isoformat() or (day == clock.date().isoformat() and clock.hour < 16):
+            if day > cutoff:
                 continue
             rows[day] = (day, positive(row[2]), None)
         earliest = min(row[0] for row in batch)
@@ -405,8 +413,10 @@ def fetch_fund(fund, archive, cfg):
     if code in DEFENSIVE_CASH_CODES:
         download(f'https://fundf10.eastmoney.com/fhsp_{code}.html', archive, f'{code}_dividends.html', cfg)
     clock = datetime.now(SHANGHAI)
+    market_date = cfg.get('_market_date')
+    cached_date = market_date or (clock.date() if clock.hour >= 16 else None)
     last_price = cfg.get('_latest_prices', {}).get(code)
-    if not cfg.get('_full_history') and last_price == clock.date().isoformat() and clock.hour >= 16:
+    if not cfg.get('_full_history') and cached_date and last_price == cached_date.isoformat():
         return [], navs
     cfg = dict(cfg)
     cfg['_price_start'] = ((datetime.fromisoformat(last_price) - timedelta(days=14)).date().isoformat()
@@ -417,7 +427,7 @@ def fetch_fund(fund, archive, cfg):
                            fields2='f51,f52,f53,f54,f55,f56,f57'))
     try:
         prices = parse_prices(json.loads(download(f'{PRICE_URL}?{query}', archive,
-                                                  f'{code}_prices.json', cfg)))
+                                                  f'{code}_prices.json', cfg)), market_date)
     except (RuntimeError, ValueError, OSError) as exc:
         print(f'{code} 东方财富行情不可用，切换腾讯: {exc}', file=sys.stderr, flush=True)
         prices = tencent_prices(fund, archive, cfg)
@@ -525,12 +535,13 @@ def join_history(prices, navs, code=None):
     return rows
 
 
-def update(root, full_history=False):
-    if not is_trading_day('CN'):
+def update(root, full_history=False, market_date=None):
+    if not is_trading_day('CN', market_date):
         print('A股休市：跳过行情及净值更新，沿用上个交易日数据', flush=True)
         return dict(discovered=0, succeeded=0, failed=0, skipped='market_closed')
     cfg = settings(root)
     cfg['_full_history'] = full_history
+    cfg['_market_date'] = market_date
     folder = root / 'data/processed/qdii'
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / 'update.lock').open('w') as lock:
@@ -667,8 +678,8 @@ def parse_market_size(source, code):
                 date=datetime.strptime(fields[30], '%Y%m%d%H%M%S').date().isoformat())
 
 
-def update_sizes(root):
-    if not is_trading_day('CN'):
+def update_sizes(root, market_date=None):
+    if not is_trading_day('CN', market_date):
         print('A股休市：跳过市值更新，沿用上个交易日数据', flush=True)
         return False
     cfg = settings(root)
@@ -700,7 +711,7 @@ REFERENCE_FUNDS = (
 )
 
 
-def parse_reference_chart(source, symbol, currency):
+def parse_reference_chart(source, symbol, currency, market_date=None):
     payload = json.loads(source)['chart']
     if payload.get('error') or not payload.get('result'):
         raise ValueError(f'{symbol}: 境外参考行情为空或错误')
@@ -713,10 +724,10 @@ def parse_reference_chart(source, symbol, currency):
     adjusted = result['indicators'].get('adjclose', [{}])[0].get('adjclose', [])
     rows = []
     for i, stamp in enumerate(result['timestamp']):
-        if closes[i] is None:
+        day = datetime.fromtimestamp(stamp, timezone).date()
+        if closes[i] is None or (market_date is not None and day > market_date):
             continue
-        row = dict(date=datetime.fromtimestamp(stamp, timezone).date().isoformat(),
-                   close=positive(closes[i]))
+        row = dict(date=day.isoformat(), close=positive(closes[i]))
         if currency == 'USD':
             # 总收益直接使用分红及拆分复权价，不再次加分红
             row['adjusted_close'] = positive(adjusted[i])
@@ -760,8 +771,8 @@ def reference_history(prices, fx):
     return rows
 
 
-def update_references(root):
-    if not is_trading_day('US'):
+def update_references(root, market_date=None):
+    if not is_trading_day('US', market_date):
         print('美股休市：跳过境外参考更新，沿用上个交易日数据', flush=True)
         return False
     cfg = settings(root)
@@ -782,7 +793,7 @@ def update_references(root):
         try:
             source = download('https://query1.finance.yahoo.com/v8/finance/chart/' + fund['code'] +
                               '?range=10y&interval=1d&events=div%2Csplits', archive, fund['code'].lower() + '.json', cfg)
-            prices = parse_reference_chart(source, fund['code'], 'USD')
+            prices = parse_reference_chart(source, fund['code'], 'USD', market_date)
             item['history'] = [dict(date=r['date'], close=r['adjusted_close']) for r in prices]
             item['cny_history'] = reference_history(prices, fx)
         except (RuntimeError, ValueError, KeyError, IndexError, TypeError) as exc:
@@ -976,6 +987,8 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     update_cmd = commands.add_parser('update')
     update_cmd.add_argument('--full-history', action='store_true', help='重新请求全部历史价格，跳过当日缓存')
+    update_cmd.add_argument('--market-date', type=date.fromisoformat, help='指定已结束的中美市场交易日期')
+    commands.add_parser('daily-market-date', help='前一日任一市场开市时输出日期，双休市时留空')
     serve = commands.add_parser('serve')
     serve.add_argument('--port', type=int, default=8765)
     commands.add_parser('install-schedule')
@@ -988,11 +1001,21 @@ def main():
     export.add_argument('--output', type=Path, default=ROOT / 'data/processed/qdii/market.json')
     args = parser.parse_args()
     root = args.root.resolve()
+    if args.command == 'daily-market-date':
+        # 北京时间早晨对应前一纽约自然日，两地常规交易均已收盘
+        market_date = datetime.now(SHANGHAI).date() - timedelta(days=1)
+        cn_open = is_trading_day('CN', market_date)
+        us_open = is_trading_day('US', market_date)
+        if cn_open or us_open:
+            print(market_date.isoformat())
+        return 0
     if args.command == 'update':
-        result = update(root, args.full_history)
+        if args.market_date and args.market_date >= datetime.now(SHANGHAI).date():
+            update_cmd.error('--market-date 必须早于今天（北京时间）')
+        result = update(root, args.full_history, args.market_date)
         print(json.dumps(result, ensure_ascii=False))
-        sizes_failed = update_sizes(root)
-        references_failed = update_references(root)
+        sizes_failed = update_sizes(root, args.market_date)
+        references_failed = update_references(root, args.market_date)
         return 1 if result['failed'] or sizes_failed or references_failed else 0
     if args.command == 'update-references':
         return int(update_references(root))
