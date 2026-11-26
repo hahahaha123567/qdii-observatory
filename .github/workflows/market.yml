@@ -84,6 +84,8 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
+      - name: Wait for Pages artifact visibility
+        run: sleep 60
       - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
